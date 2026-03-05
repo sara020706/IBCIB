@@ -57,9 +57,23 @@ async def lifespan(app: FastAPI):
     """Load the Keras model when the server starts."""
     global model
     try:
-        # Import Keras directly for better Keras 3 compatibility
         import keras
-        # Use abspath so the path works regardless of launch directory
+        from keras.layers import Dense
+
+        # -----------------------------------------------------------------------
+        # Monkey-patch Dense.from_config to ignore unknown keys like
+        # 'quantization_config' that appear in models saved with newer Keras 3.
+        # -----------------------------------------------------------------------
+        _original_dense_from_config = Dense.from_config.__func__
+
+        @classmethod  # type: ignore[misc]
+        def _patched_dense_from_config(cls, config):
+            config.pop("quantization_config", None)
+            return _original_dense_from_config(cls, config)
+
+        Dense.from_config = _patched_dense_from_config  # type: ignore[method-assign]
+        # -----------------------------------------------------------------------
+
         model_path = BASE_DIR / "best_model.keras"
         print(f"[IBCIB] Loading model from: {model_path}")
         model = keras.models.load_model(str(model_path))
