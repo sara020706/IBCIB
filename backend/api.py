@@ -57,12 +57,12 @@ async def lifespan(app: FastAPI):
     """Load the Keras model when the server starts."""
     global model
     try:
-        # Import TF here so the server can at least start before heavy import
-        import tensorflow as tf
+        # Import Keras directly for better Keras 3 compatibility
+        import keras
         # Use abspath so the path works regardless of launch directory
         model_path = BASE_DIR / "best_model.keras"
         print(f"[IBCIB] Loading model from: {model_path}")
-        model = tf.keras.models.load_model(str(model_path))
+        model = keras.models.load_model(str(model_path))
         print("[IBCIB] Model loaded successfully.")
     except Exception as exc:
         print(f"[IBCIB] WARNING – model failed to load: {exc}")
