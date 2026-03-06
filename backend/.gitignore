@@ -1,0 +1,6 @@
+# Backend-specific git ignores
+*.pth
+*.keras
+*.h5
+__pycache__/
+.env
