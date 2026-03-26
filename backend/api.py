@@ -56,8 +56,8 @@ async def lifespan(app: FastAPI):
     try:
         from huggingface_hub import hf_hub_download
 
-        print(f"[IBCIB] Downloading model from HF Hub: {HF_REPO_ID} ...")
-        model_path   = hf_hub_download(HF_REPO_ID, HF_MODEL_FILE)
+        print(f"[IBCIB] Loading local ONNX model...")
+        model_path   = str(BASE_DIR / HF_MODEL_FILE)
         classes_path = hf_hub_download(HF_REPO_ID, HF_CLASSES_FILE)
 
         with open(classes_path, "r") as f:
