@@ -6,8 +6,8 @@ FastAPI REST API (PyTorch + Hugging Face Hub)
 import io
 import os
 import json
-import torch
 import numpy as np
+import onnxruntime as ort
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -33,15 +33,16 @@ CORS_ORIGINS: list[str] = (
 
 # HF repo details
 HF_REPO_ID = "ujjwal75/indian-bovine-breeds-model"
-HF_MODEL_FILE = "Indian_bovine_finetuned_model.pth"
+# Assuming the user will upload the `.onnx` model to their repo
+HF_MODEL_FILE = "Indian_bovine_finetuned_model.onnx"
 HF_CLASSES_FILE = "classes.json"
 
 IMG_SIZE = (224, 224)
-# ImageNet normalization – matches training preprocessing
-IMG_MEAN = [0.485, 0.456, 0.406]
-IMG_STD  = [0.229, 0.224, 0.225]
+# ImageNet normalization
+IMG_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMG_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-model = None
+ort_session = None
 CLASS_NAMES: list[str] = []
 
 
@@ -50,11 +51,10 @@ CLASS_NAMES: list[str] = []
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Download model from HF Hub and load into memory at startup."""
-    global model, CLASS_NAMES
+    """Download model from HF Hub and load ONNX session at startup."""
+    global ort_session, CLASS_NAMES
     try:
         from huggingface_hub import hf_hub_download
-        import torchvision.models as tv_models
 
         print(f"[IBCIB] Downloading model from HF Hub: {HF_REPO_ID} ...")
         model_path   = hf_hub_download(HF_REPO_ID, HF_MODEL_FILE)
@@ -65,14 +65,10 @@ async def lifespan(app: FastAPI):
 
         print(f"[IBCIB] Loaded {len(CLASS_NAMES)} classes.")
 
-        net = tv_models.resnet50(num_classes=len(CLASS_NAMES))
-        state = torch.load(model_path, map_location="cpu", weights_only=True)
-        net.load_state_dict(state)
-        net.eval()
-        model = net
-        print("[IBCIB] Model loaded successfully.")
+        ort_session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+        print("[IBCIB] ONNX Model loaded successfully.")
     except Exception as exc:
-        print(f"[IBCIB] WARNING – model failed to load: {exc}")
+        print(f"[IBCIB] WARNING – model failed to load (did you upload the .onnx to Hugging Face?): {exc}")
     yield
     # Cleanup (nothing needed)
 
@@ -99,17 +95,20 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def preprocess_image(image_bytes: bytes) -> torch.Tensor:
-    """Resize, normalise and batch a raw image for ResNet-50 inference."""
-    from torchvision import transforms
-
-    transform = transforms.Compose([
-        transforms.Resize(IMG_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=IMG_MEAN, std=IMG_STD),
-    ])
+def preprocess_image(image_bytes: bytes) -> np.ndarray:
+    """Resize, normalise and batch a raw image using PIL and NumPy."""
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    return transform(img).unsqueeze(0)   # shape: (1, 3, 224, 224)
+    img = img.resize(IMG_SIZE, Image.Resampling.BILINEAR)
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    
+    # Normalize channels
+    img_array = (img_array - IMG_MEAN) / IMG_STD
+    
+    # HWC to CHW
+    img_array = img_array.transpose(2, 0, 1)
+    
+    # Add batch dimension
+    return np.expand_dims(img_array, axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +116,7 @@ def preprocess_image(image_bytes: bytes) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 @app.get("/health", summary="Health check")
 def health():
-    return {"status": "ok", "model_loaded": model is not None, "num_classes": len(CLASS_NAMES)}
+    return {"status": "ok", "model_loaded": ort_session is not None, "num_classes": len(CLASS_NAMES)}
 
 
 @app.post("/predict", summary="Classify a cattle image")
@@ -128,10 +127,10 @@ async def predict(file: UploadFile = File(...)):
     - `confidence` – probability of the top prediction (0–1)
     - `top5`       – list of the top-5 predictions with breed + confidence
     """
-    if model is None:
+    if ort_session is None:
         raise HTTPException(
             status_code=503,
-            detail="Model is not loaded. Please check the server logs.",
+            detail="Model is not loaded. Please make sure the ONNX model is available on Hugging Face.",
         )
 
     content_type = (file.content_type or "").split(";")[0].strip().lower()
@@ -148,22 +147,25 @@ async def predict(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
 
     try:
-        with torch.no_grad():
-            outputs = model(tensor)                     # (1, num_classes)
-            probs   = torch.softmax(outputs, dim=1)[0]  # (num_classes,)
+        inputs = {ort_session.get_inputs()[0].name: tensor}
+        outputs = ort_session.run(None, inputs)[0]
+        
+        # Softmax
+        exp_out = np.exp(outputs - np.max(outputs, axis=1, keepdims=True))
+        probs = (exp_out / np.sum(exp_out, axis=1, keepdims=True))[0]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prediction error: {exc}")
 
     # Top-1
-    top1_idx   = int(torch.argmax(probs).item())
+    top1_idx   = int(np.argmax(probs))
     top1_breed = CLASS_NAMES[top1_idx]
-    top1_conf  = float(probs[top1_idx].item())
+    top1_conf  = float(probs[top1_idx])
 
     # Top-5
-    top5_vals, top5_idxs = torch.topk(probs, k=5)
+    top5_idxs = np.argsort(probs)[-5:][::-1]
     top5 = [
-        {"breed": CLASS_NAMES[int(i)], "confidence": round(float(v), 4)}
-        for v, i in zip(top5_vals, top5_idxs)
+        {"breed": CLASS_NAMES[int(i)], "confidence": round(float(probs[i]), 4)}
+        for i in top5_idxs
     ]
 
     return JSONResponse({
